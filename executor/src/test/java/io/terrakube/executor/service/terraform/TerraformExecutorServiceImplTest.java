@@ -88,8 +88,8 @@ class TerraformExecutorServiceImplTest {
         when(streamOperations.size(anyString())).thenReturn(0L);
         when(terraformState.getBackendStateFile(anyString(), anyString(), any(File.class), anyString())).thenReturn("backend.tfvars");
         when(structuredOutputPersistenceQueue.awaitDrain(any())).thenReturn(true);
-        when(planStructuredOutputService.publishFinalPlanSynchronous(any(), any(), any(), any())).thenReturn(true);
-        when(applyStructuredOutputService.publishFinalApplySynchronous(any(), any(), any(), any(), any())).thenReturn(true);
+        when(planStructuredOutputService.publishFinalPlanSynchronous(any(), any(), any(), any())).thenReturn("ACKED");
+        when(applyStructuredOutputService.publishFinalApplySynchronous(any(), any(), any(), any(), any())).thenReturn("ACKED");
         structuredOutputProperties.setDrainTimeoutMs(1000);
         Mockito.doCallRealMethod().when(applyStructuredOutputService).finalizeResourceStatuses(any(), anyBoolean(), anyBoolean());
 
