@@ -360,17 +360,24 @@ public class TerraformExecutorServiceImpl implements TerraformExecutor {
 
             scriptAfterSuccessPlan = executePostOperationScripts(terraformJob, terraformWorkingDir, planOutput, executionPlan);
 
+            drainStructuredOutputQueue(terraformJob.getJobId());
+
+            long planRevision = System.currentTimeMillis();
+            terraformJob.setDeliveryRevision(planRevision);
             // Synchronous authoritative final snapshot delivery with explicit ACK from the API.
             String planDeliveryState = "NOT_DURABLE";
             if (executionPlan) {
                 planDeliveryState = planStructuredOutputService.publishFinalPlanSynchronous(terraformJob, terraformWorkingDir, terraformJob.getLiveChanges(), terraformJob.getJobDiagnostics());
+            } else if (planCommandExecuted || (terraformJob.getJobDiagnostics() != null && !terraformJob.getJobDiagnostics().isEmpty())) {
+                planDeliveryState = planStructuredOutputService.publishFinalPlanSnapshotSynchronous(
+                        terraformJob.getOrganizationId(), terraformJob.getJobId(), terraformJob.getStepId(), planRevision,
+                        terraformJob.getLiveChanges(), terraformJob.getJobDiagnostics());
             }
-
-            drainStructuredOutputQueue(terraformJob.getJobId());
 
             result = generateJobResult(scriptAfterSuccessPlan, jobOutput.toString(), jobErrorOutput.toString());
             result.setDeliveryState(planDeliveryState);
             result.setDeliveryTimestamp(System.currentTimeMillis());
+            result.setDeliveryRevision(planRevision);
             result.setPlanFile(executionPlan ? terraformState.saveTerraformPlan(terraformJob.getOrganizationId(),
                     terraformJob.getWorkspaceId(), terraformJob.getJobId(), terraformJob.getStepId(), terraformWorkingDir)
                     : "");
@@ -382,18 +389,19 @@ public class TerraformExecutorServiceImpl implements TerraformExecutor {
             // A stream-drain failure or late exception must not swallow the plan diagnostics the
             // UI needs - publish what was parsed before it broke, then let it drain.
             String failureDeliveryState = "NOT_DURABLE";
+            long failureRevision = System.currentTimeMillis();
             try {
-                publishFinalPlanSnapshotIfStreamed(terraformJob, eventParser, liveChanges, jobDiagnostics);
-                failureDeliveryState = planStructuredOutputService.publishFinalPlanSnapshotSynchronous(
-                        terraformJob.getOrganizationId(), terraformJob.getJobId(), terraformJob.getStepId(),
-                        liveChanges, jobDiagnostics);
                 drainStructuredOutputQueue(terraformJob.getJobId());
+                failureDeliveryState = planStructuredOutputService.publishFinalPlanSnapshotSynchronous(
+                        terraformJob.getOrganizationId(), terraformJob.getJobId(), terraformJob.getStepId(), failureRevision,
+                        liveChanges, jobDiagnostics);
             } catch (Exception e) {
                 log.warn("Unable to publish final plan snapshot after failure for job {}", terraformJob.getJobId(), e);
             }
             result = setError(exception, jobOutput.toString());
             result.setDeliveryState(failureDeliveryState);
             result.setDeliveryTimestamp(System.currentTimeMillis());
+            result.setDeliveryRevision(failureRevision);
             result.setPlan(true);
             result.setExitCode(1);
         }
@@ -507,28 +515,33 @@ public class TerraformExecutorServiceImpl implements TerraformExecutor {
             log.warn("Terraform apply Executed Successfully: {}", execution);
             scriptAfterSuccess = executePostOperationScripts(terraformJob, terraformWorkingDir, applyOutput, execution || terraformJob.isIgnoreError());
 
+            drainStructuredOutputQueue(terraformJob.getJobId());
+
+            long applyRevision = System.currentTimeMillis();
             // Synchronous authoritative final apply snapshot delivery with explicit ACK from the API.
             String applyDeliveryState = applyStructuredOutputService.publishFinalApplySynchronous(
-                    terraformJob.getOrganizationId(), terraformJob.getJobId(), terraformJob.getStepId(),
+                    terraformJob.getOrganizationId(), terraformJob.getJobId(), terraformJob.getStepId(), applyRevision,
                     terraformJob.getLiveChanges(), terraformJob.getJobDiagnostics());
 
-            drainStructuredOutputQueue(terraformJob.getJobId());
             result = generateJobResult(scriptAfterSuccess, terraformOutput.toString(), terraformErrorOutput.toString());
             result.setDeliveryState(applyDeliveryState);
             result.setDeliveryTimestamp(System.currentTimeMillis());
+            result.setDeliveryRevision(applyRevision);
         } catch (IOException | ExecutionException | InterruptedException exception) {
             String failureDeliveryState = "NOT_DURABLE";
+            long failureRevision = System.currentTimeMillis();
             try {
+                drainStructuredOutputQueue(terraformJob.getJobId());
                 failureDeliveryState = applyStructuredOutputService.publishFinalApplySynchronous(
-                        terraformJob.getOrganizationId(), terraformJob.getJobId(), terraformJob.getStepId(),
+                        terraformJob.getOrganizationId(), terraformJob.getJobId(), terraformJob.getStepId(), failureRevision,
                         terraformJob.getLiveChanges(), terraformJob.getJobDiagnostics());
             } catch (Exception e) {
                 log.warn("Unable to publish final apply snapshot after failure for job {}", terraformJob.getJobId(), e);
             }
-            drainStructuredOutputQueue(terraformJob.getJobId());
             result = setError(exception, terraformOutput.toString());
             result.setDeliveryState(failureDeliveryState);
             result.setDeliveryTimestamp(System.currentTimeMillis());
+            result.setDeliveryRevision(failureRevision);
             result.setExitCode(1);
         }
         return result;
@@ -595,6 +608,8 @@ public class TerraformExecutorServiceImpl implements TerraformExecutor {
                 }
             }
             applyStructuredOutputService.finalizeResourceStatuses(changes, execution, wasInterrupted);
+            terraformJob.setLiveChanges(changes);
+            terraformJob.setJobDiagnostics(jobDiagnostics);
             publishFinalApplySnapshotIfStreamed(terraformJob, eventParser, changes, jobDiagnostics);
         }
 
@@ -645,6 +660,8 @@ public class TerraformExecutorServiceImpl implements TerraformExecutor {
             release(jsonDestroyClient);
             boolean wasInterrupted = interrupted || (!execution && shuttingDown.get());
             applyStructuredOutputService.finalizeResourceStatuses(changes, execution, wasInterrupted);
+            terraformJob.setLiveChanges(changes);
+            terraformJob.setJobDiagnostics(jobDiagnostics);
             publishFinalApplySnapshotIfStreamed(terraformJob, eventParser, changes, jobDiagnostics);
         }
 
@@ -800,10 +817,31 @@ public class TerraformExecutorServiceImpl implements TerraformExecutor {
 
             waitForStreamCompletion(terraformJob.getJobId(), 300);
             drainStructuredOutputQueue(terraformJob.getJobId());
+
+            long destroyRevision = System.currentTimeMillis();
+            String destroyDeliveryState = applyStructuredOutputService.publishFinalApplySynchronous(
+                    terraformJob.getOrganizationId(), terraformJob.getJobId(), terraformJob.getStepId(), destroyRevision,
+                    terraformJob.getLiveChanges(), terraformJob.getJobDiagnostics());
+
             result = generateJobResult(scriptAfterSuccess, jobOutput.toString(), jobErrorOutput.toString());
+            result.setDeliveryState(destroyDeliveryState);
+            result.setDeliveryTimestamp(System.currentTimeMillis());
+            result.setDeliveryRevision(destroyRevision);
         } catch (IOException | ExecutionException | InterruptedException exception) {
-            drainStructuredOutputQueue(terraformJob.getJobId());
+            String failureDeliveryState = "NOT_DURABLE";
+            long failureRevision = System.currentTimeMillis();
+            try {
+                drainStructuredOutputQueue(terraformJob.getJobId());
+                failureDeliveryState = applyStructuredOutputService.publishFinalApplySynchronous(
+                        terraformJob.getOrganizationId(), terraformJob.getJobId(), terraformJob.getStepId(), failureRevision,
+                        terraformJob.getLiveChanges(), terraformJob.getJobDiagnostics());
+            } catch (Exception e) {
+                log.warn("Unable to publish final apply snapshot after destroy failure for job {}", terraformJob.getJobId(), e);
+            }
             result = setError(exception, jobOutput.toString());
+            result.setDeliveryState(failureDeliveryState);
+            result.setDeliveryTimestamp(System.currentTimeMillis());
+            result.setDeliveryRevision(failureRevision);
             result.setExitCode(1);
         }
         return result;
