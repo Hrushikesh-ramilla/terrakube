@@ -24,8 +24,11 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.server.ResponseStatusException;
 
+import org.springframework.data.redis.core.RedisTemplate;
+
 import java.io.IOException;
 import java.security.Principal;
+import java.time.Duration;
 import java.util.EnumSet;
 import java.util.Optional;
 import java.util.Set;
@@ -44,6 +47,9 @@ public class ContextController {
             JobStatus.noChanges);
 
     private static final String PENDING_BODY = "{\"structuredOutputStatus\":{\"state\":\"PENDING\"}}";
+
+    private static final String CONTEXT_LOCK_PREFIX = "job-context-lock:";
+    private static final Duration CONTEXT_LOCK_TTL = Duration.ofSeconds(10);
 
     private final StorageTypeService storageTypeService;
 
@@ -65,6 +71,8 @@ public class ContextController {
 
     private final AuthenticatedUser authenticatedUser;
 
+    private final RedisTemplate<String, Object> redisTemplate;
+
     @Autowired
     public ContextController(
             StorageTypeService storageTypeService,
@@ -76,7 +84,8 @@ public class ContextController {
             ContextProperties contextProperties,
             io.terrakube.api.plugin.policy.PolicyEvaluationService policyEvaluationService,
             JobLogAccessService jobLogAccessService,
-            AuthenticatedUser authenticatedUser) {
+            AuthenticatedUser authenticatedUser,
+            @Autowired(required = false) RedisTemplate<String, Object> redisTemplate) {
         this.storageTypeService = storageTypeService;
         this.jobRepository = jobRepository;
         this.contextSanitizer = contextSanitizer;
@@ -87,6 +96,22 @@ public class ContextController {
         this.policyEvaluationService = policyEvaluationService;
         this.jobLogAccessService = jobLogAccessService;
         this.authenticatedUser = authenticatedUser;
+        this.redisTemplate = redisTemplate;
+    }
+
+    public ContextController(
+            StorageTypeService storageTypeService,
+            JobRepository jobRepository,
+            ContextSanitizer contextSanitizer,
+            StreamingService streamingService,
+            ContextStorageMetrics contextStorageMetrics,
+            ContextReadService contextReadService,
+            ContextProperties contextProperties,
+            io.terrakube.api.plugin.policy.PolicyEvaluationService policyEvaluationService,
+            JobLogAccessService jobLogAccessService,
+            AuthenticatedUser authenticatedUser) {
+        this(storageTypeService, jobRepository, contextSanitizer, streamingService,
+                contextStorageMetrics, contextReadService, contextProperties, policyEvaluationService, jobLogAccessService, authenticatedUser, null);
     }
 
     public ContextController(
@@ -213,20 +238,61 @@ public class ContextController {
             return new ResponseEntity<>("{}", HttpStatus.CONFLICT);
         }
 
+        if (!acquireContextLock(jobId)) {
+            log.warn("Context lock busy for job {}", jobId);
+            return new ResponseEntity<>("{}", HttpStatus.SERVICE_UNAVAILABLE);
+        }
+
         String savedContext;
         try {
             String contextToSave = sanitizedContext;
             savedContext = contextStorageMetrics.time("write", () -> storageTypeService.saveContext(jobId, contextToSave));
+            // Refresh the read cache so a Job Details page open right after the write sees this snapshot.
+            contextReadService.invalidate(jobId, savedContext);
+            if (policyEvaluationService != null) {
+                policyEvaluationService.processPolicyEvaluationContext(jobId, sanitizedContext);
+            }
+            return new ResponseEntity<>(savedContext, HttpStatus.OK);
         } catch (IOException | RuntimeException e) {
             log.warn("Controlled failure saving context for job {}: {}", jobId, e.getMessage());
             return new ResponseEntity<>("{}", HttpStatus.SERVICE_UNAVAILABLE);
+        } finally {
+            releaseContextLock(jobId);
         }
-        // Refresh the read cache so a Job Details page open right after the write sees this snapshot.
-        contextReadService.invalidate(jobId, savedContext);
-        if (policyEvaluationService != null) {
-            policyEvaluationService.processPolicyEvaluationContext(jobId, sanitizedContext);
+    }
+
+    private boolean acquireContextLock(int jobId) {
+        if (redisTemplate == null) {
+            return true;
         }
-        return new ResponseEntity<>(savedContext, HttpStatus.OK);
+        try {
+            for (int i = 0; i < 5; i++) {
+                Boolean acquired = redisTemplate.opsForValue()
+                        .setIfAbsent(CONTEXT_LOCK_PREFIX + jobId, "1", CONTEXT_LOCK_TTL);
+                if (Boolean.TRUE.equals(acquired)) {
+                    return true;
+                }
+                Thread.sleep(100);
+            }
+            return false;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        } catch (Exception e) {
+            log.warn("Could not reach Redis to acquire context lock for Job {}: {}", jobId, e.getMessage());
+            return true;
+        }
+    }
+
+    private void releaseContextLock(int jobId) {
+        if (redisTemplate == null) {
+            return;
+        }
+        try {
+            redisTemplate.delete(CONTEXT_LOCK_PREFIX + jobId);
+        } catch (Exception e) {
+            log.warn("Could not reach Redis to release context lock for Job {}: {}", jobId, e.getMessage());
+        }
     }
 
     public SseEmitter streamContext(String jobId, String lastEventId) {
