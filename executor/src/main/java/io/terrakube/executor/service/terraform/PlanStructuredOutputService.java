@@ -163,21 +163,18 @@ public class PlanStructuredOutputService {
 
     public String publishFinalPlanSnapshotSynchronous(String organizationId, String jobId, String stepId, long deliveryRevision,
                                                       List<Map<String, Object>> changes, List<Map<String, Object>> jobDiagnostics) {
-        Map<String, Object> updatedContext = null;
-        try {
-            Map<String, Object> context = getCurrentContext(organizationId, jobId);
-            updatedContext = updateContext(context, stepId, changes, jobDiagnostics);
-            applyNoChangePlanMarker(updatedContext, stepId, changes, jobDiagnostics);
-            updatedContext.put("structuredOutputStatus", Map.of(
-                    "state", "PERSISTED",
-                    "updatedAtEpochMs", System.currentTimeMillis(),
-                    "stepId", stepId,
-                    "phase", "plan",
-                    "finalSnapshot", true));
+        Map<String, Object> set = buildPlanPatch(stepId, changes, jobDiagnostics, true);
+        set.put("structuredOutputStatus", Map.of(
+                "state", "PERSISTED",
+                "updatedAtEpochMs", System.currentTimeMillis(),
+                "stepId", stepId,
+                "phase", "plan",
+                "finalSnapshot", true));
 
+        try {
             for (int attempt = 1; attempt <= 3; attempt++) {
-                boolean saved = jobContextService.saveContextChecked(organizationId, jobId, updatedContext);
-                if (saved) {
+                JobContextService.PatchResult result = jobContextService.patchContext(organizationId, jobId, deliveryRevision, set);
+                if (result == JobContextService.PatchResult.APPLIED || result == JobContextService.PatchResult.SKIPPED) {
                     log.info("Synchronous final plan snapshot persisted and ACKed for job {} step {}", jobId, stepId);
                     pushLiveUpdate("plan", jobId, stepId, changes, jobDiagnostics);
                     return "ACKED";
@@ -194,25 +191,27 @@ public class PlanStructuredOutputService {
             log.warn("Failed to obtain synchronous ACK for final plan snapshot for job {} step {} after 3 attempts", jobId, stepId);
         } catch (Exception e) {
             log.warn("Error publishing synchronous final plan snapshot for job {} step {}: {}", jobId, stepId, e.getMessage());
-            if (updatedContext == null) {
-                updatedContext = new LinkedHashMap<>();
-                updatedContext.put(CONTEXT_PLAN_KEY, Map.of(stepId, changes != null ? changes : List.of()));
-                if (jobDiagnostics != null && !jobDiagnostics.isEmpty()) {
-                    updatedContext.put(CONTEXT_JOB_DIAGNOSTICS_KEY, Map.of(stepId, jobDiagnostics));
-                }
-                updatedContext.put(CONTEXT_UI_KEY, Map.of(stepId, STRUCTURED_PLAN_MARKER));
-                applyNoChangePlanMarker(updatedContext, stepId, changes, jobDiagnostics);
-                updatedContext.put("structuredOutputStatus", Map.of(
-                        "state", "PERSISTED",
-                        "updatedAtEpochMs", System.currentTimeMillis(),
-                        "stepId", stepId,
-                        "phase", "plan",
-                        "finalSnapshot", true));
-            }
         }
 
-        if (contextSpoolService != null && updatedContext != null) {
-            String spooledPath = contextSpoolService.spoolContextPatch(organizationId, jobId, stepId, "plan", deliveryRevision, updatedContext);
+        Map<String, Object> spooledPatch = new LinkedHashMap<>();
+        spooledPatch.put(CONTEXT_PLAN_KEY, Map.of(stepId, changes != null ? changes : List.of()));
+        if (jobDiagnostics != null && !jobDiagnostics.isEmpty()) {
+            spooledPatch.put(CONTEXT_JOB_DIAGNOSTICS_KEY, Map.of(stepId, jobDiagnostics));
+        }
+        spooledPatch.put(CONTEXT_UI_KEY, Map.of(stepId, STRUCTURED_PLAN_MARKER));
+        boolean noChanges = !hasPlanErrors(changes, jobDiagnostics) && (changes == null || changes.isEmpty());
+        if (noChanges) {
+            spooledPatch.put(CONTEXT_NO_CHANGE_PLAN_KEY, Map.of("planStepId", stepId));
+        }
+        spooledPatch.put("structuredOutputStatus", Map.of(
+                "state", "PERSISTED",
+                "updatedAtEpochMs", System.currentTimeMillis(),
+                "stepId", stepId,
+                "phase", "plan",
+                "finalSnapshot", true));
+
+        if (contextSpoolService != null) {
+            String spooledPath = contextSpoolService.spoolContextPatch(organizationId, jobId, stepId, "plan", deliveryRevision, spooledPatch);
             if (spooledPath != null) {
                 log.info("Successfully spooled final plan snapshot to storage at {} for job {} step {}", spooledPath, jobId, stepId);
                 return "SPOOLED";
@@ -257,7 +256,7 @@ public class PlanStructuredOutputService {
         if (executorFlagsProperties.isAsyncStructuredOutput() && persistenceQueue != null) {
             try {
                 StructuredSnapshot snapshot = StructuredSnapshot.copyOf(organizationId, jobId, stepId,
-                        StructuredSnapshot.Phase.PLAN, persistenceQueue.nextSequence(), finalSnapshot,
+                        StructuredSnapshot.Phase.PLAN, persistenceQueue.nextSequence(jobId), finalSnapshot,
                         liveChanges, jobDiagnostics, objectMapper);
                 persistenceQueue.submit(snapshot);
             } catch (StructuredSnapshot.SnapshotSerializationException e) {
@@ -269,12 +268,8 @@ public class PlanStructuredOutputService {
         }
 
         try {
-            Map<String, Object> context = getCurrentContext(organizationId, jobId);
-            Map<String, Object> updatedContext = updateContext(context, stepId, liveChanges, jobDiagnostics);
-            if (finalSnapshot) {
-                applyNoChangePlanMarker(updatedContext, stepId, liveChanges, jobDiagnostics);
-            }
-            saveContext(organizationId, jobId, updatedContext);
+            jobContextService.patchContextFresh(organizationId, jobId,
+                    buildPlanPatch(stepId, liveChanges, jobDiagnostics, finalSnapshot));
         } catch (Exception e) {
             log.warn("Unable to publish live plan progress for job {} step {}", jobId, stepId, e);
         }
@@ -374,12 +369,8 @@ public class PlanStructuredOutputService {
         }
 
         try {
-            Map<String, Object> context = getCurrentContext(organizationId, jobId);
-            Map<String, Object> updatedContext = new HashMap<>(context);
-            Map<String, Object> renderedTextByStep = toMap(updatedContext.get(CONTEXT_PLAN_RENDERED_TEXT_KEY));
-            renderedTextByStep.put(stepId, renderedText);
-            updatedContext.put(CONTEXT_PLAN_RENDERED_TEXT_KEY, renderedTextByStep);
-            saveContext(organizationId, jobId, updatedContext);
+            jobContextService.patchContextFresh(organizationId, jobId,
+                    Map.of(CONTEXT_PLAN_RENDERED_TEXT_KEY + "/" + stepId, renderedText));
         } catch (Exception e) {
             log.warn("Unable to persist rendered plan text for job {} step {}: {}", jobId, stepId, e.getMessage());
         }
@@ -502,63 +493,30 @@ public class PlanStructuredOutputService {
         return result;
     }
 
-    Map<String, Object> updateContext(Map<String, Object> context, String stepId, List<Map<String, Object>> changes, List<Map<String, Object>> jobDiagnostics) {
-        Map<String, Object> updatedContext = new HashMap<>(context);
-
-        Map<String, Object> planStructuredOutput = toMap(updatedContext.get(CONTEXT_PLAN_KEY));
-        planStructuredOutput.put(stepId, changes);
-        updatedContext.put(CONTEXT_PLAN_KEY, planStructuredOutput);
-
-        Map<String, Object> terrakubeUi = toMap(updatedContext.get(CONTEXT_UI_KEY));
-        terrakubeUi.put(stepId, STRUCTURED_PLAN_MARKER);
-        updatedContext.put(CONTEXT_UI_KEY, terrakubeUi);
-
-        Map<String, Object> jobDiagnosticsByStep = toMap(updatedContext.get(CONTEXT_JOB_DIAGNOSTICS_KEY));
-        jobDiagnosticsByStep.put(stepId, jobDiagnostics);
-        updatedContext.put(CONTEXT_JOB_DIAGNOSTICS_KEY, jobDiagnosticsByStep);
-
-        return updatedContext;
-    }
-
     /**
-     * A no-change plan writes an explicit {@code noChangePlan} marker (with its plan step id) so the
-     * UI can treat the associated standard apply as a valid no-op without inferring it from an empty
-     * array or console text. The marker is cleared as soon as a real change is recorded for the step.
-     * Only written from authoritative final writes (plan summary / final snapshot), never progress.
-     * Must never be set if the plan encountered errors or has error diagnostics.
+     * Context patch entries for this step. A final write also sets or clears (null) the
+     * {@code noChangePlan} marker, with its plan step id, so the UI can treat the associated
+     * standard apply as a valid no-op without inferring it from an empty array or console text.
+     * Progress writes never touch the marker, and it is never set if the plan encountered errors
+     * or has error diagnostics.
      */
-    static void applyNoChangePlanMarker(Map<String, Object> context, String stepId, List<?> changes, List<Map<String, Object>> jobDiagnostics) {
-        boolean hasErrors = (jobDiagnostics != null && jobDiagnostics.stream().anyMatch(d -> "error".equals(d.get("severity"))));
-        if (!hasErrors && changes != null) {
-            hasErrors = changes.stream().anyMatch(c -> {
-                if (c instanceof Map<?, ?> m) {
-                    return "errored".equals(m.get("status"));
-                }
-                return false;
-            });
+    Map<String, Object> buildPlanPatch(String stepId, List<Map<String, Object>> changes,
+                                       List<Map<String, Object>> jobDiagnostics, boolean finalSnapshot) {
+        // LinkedHashMap, not Map.of: values may be null.
+        Map<String, Object> set = new LinkedHashMap<>();
+        set.put(CONTEXT_PLAN_KEY + "/" + stepId, changes);
+        set.put(CONTEXT_UI_KEY + "/" + stepId, STRUCTURED_PLAN_MARKER);
+        set.put(CONTEXT_JOB_DIAGNOSTICS_KEY + "/" + stepId, jobDiagnostics);
+        if (finalSnapshot) {
+            boolean noChanges = !hasPlanErrors(changes, jobDiagnostics) && (changes == null || changes.isEmpty());
+            set.put(CONTEXT_NO_CHANGE_PLAN_KEY, noChanges ? Map.of("planStepId", stepId) : null);
         }
-        if (!hasErrors && (changes == null || changes.isEmpty())) {
-            context.put(CONTEXT_NO_CHANGE_PLAN_KEY, Map.of("planStepId", stepId));
-        } else {
-            context.remove(CONTEXT_NO_CHANGE_PLAN_KEY);
-        }
+        return set;
     }
 
-    private Map<String, Object> getCurrentContext(String organizationId, String jobId) {
-        return jobContextService.getCurrentContext(organizationId, jobId);
-    }
-
-    private void saveContext(String organizationId, String jobId, Map<String, Object> context) {
-        jobContextService.saveContext(organizationId, jobId, context);
-    }
-
-    private Map<String, Object> toMap(Object value) {
-        if (value instanceof Map<?, ?> map) {
-            Map<String, Object> typed = new HashMap<>();
-            map.forEach((k, v) -> typed.put(String.valueOf(k), v));
-            return typed;
-        }
-        return new HashMap<>();
+    private static boolean hasPlanErrors(List<Map<String, Object>> changes, List<Map<String, Object>> jobDiagnostics) {
+        return (jobDiagnostics != null && jobDiagnostics.stream().anyMatch(d -> "error".equals(d.get("severity"))))
+                || (changes != null && changes.stream().anyMatch(c -> "errored".equals(c.get("status"))));
     }
 
     private String normalizeAction(List<String> actions) {

@@ -1,68 +1,41 @@
 package io.terrakube.api.plugin.context;
 
 import com.fasterxml.jackson.core.JacksonException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.yahoo.elide.core.security.User;
-import lombok.AllArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.connection.stream.RecordId;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import io.terrakube.api.plugin.security.user.AuthenticatedUser;
-import io.terrakube.api.plugin.storage.StorageTypeService;
 import io.terrakube.api.plugin.streaming.StreamingService;
-import io.terrakube.api.repository.JobRepository;
-import io.terrakube.api.rs.job.Job;
-import io.terrakube.api.rs.job.JobStatus;
 
 import io.terrakube.api.plugin.security.job.JobLogAccessService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.server.ResponseStatusException;
 
-import org.springframework.data.redis.core.RedisTemplate;
-
 import java.io.IOException;
 import java.security.Principal;
-import java.time.Duration;
-import java.util.EnumSet;
-import java.util.Optional;
-import java.util.Set;
-import java.util.UUID;
 
 @Slf4j
 @RestController
 @RequestMapping("/context/v1")
 public class ContextController {
-    private static final Set<JobStatus> CONTEXT_WRITABLE_JOB_STATUSES = EnumSet.of(
-            JobStatus.pending,
-            JobStatus.waitingApproval,
-            JobStatus.approved,
-            JobStatus.queue,
-            JobStatus.running,
-            JobStatus.completed,
-            JobStatus.noChanges);
-
     private static final String PENDING_BODY = "{\"structuredOutputStatus\":{\"state\":\"PENDING\"}}";
-
-    private static final String CONTEXT_LOCK_PREFIX = "job-context-lock:";
-    private static final Duration CONTEXT_LOCK_TTL = Duration.ofSeconds(30);
-
-    private final StorageTypeService storageTypeService;
-
-    private final JobRepository jobRepository;
 
     private final ContextSanitizer contextSanitizer;
 
     private final StreamingService streamingService;
 
-    private final ContextStorageMetrics contextStorageMetrics;
-
     private final ContextReadService contextReadService;
+
+    private final ContextWriteService contextWriteService;
 
     private final ContextProperties contextProperties;
 
@@ -72,88 +45,28 @@ public class ContextController {
 
     private final AuthenticatedUser authenticatedUser;
 
-    private final RedisTemplate<String, Object> redisTemplate;
+    private final ObjectMapper objectMapper;
 
     @Autowired
     public ContextController(
-            StorageTypeService storageTypeService,
-            JobRepository jobRepository,
             ContextSanitizer contextSanitizer,
             StreamingService streamingService,
-            ContextStorageMetrics contextStorageMetrics,
             ContextReadService contextReadService,
+            ContextWriteService contextWriteService,
             ContextProperties contextProperties,
             io.terrakube.api.plugin.policy.PolicyEvaluationService policyEvaluationService,
             JobLogAccessService jobLogAccessService,
             AuthenticatedUser authenticatedUser,
-            @Autowired(required = false) RedisTemplate<String, Object> redisTemplate) {
-        this.storageTypeService = storageTypeService;
-        this.jobRepository = jobRepository;
+            ObjectMapper objectMapper) {
         this.contextSanitizer = contextSanitizer;
         this.streamingService = streamingService;
-        this.contextStorageMetrics = contextStorageMetrics;
         this.contextReadService = contextReadService;
+        this.contextWriteService = contextWriteService;
         this.contextProperties = contextProperties;
         this.policyEvaluationService = policyEvaluationService;
         this.jobLogAccessService = jobLogAccessService;
         this.authenticatedUser = authenticatedUser;
-        this.redisTemplate = redisTemplate;
-    }
-
-    public ContextController(
-            StorageTypeService storageTypeService,
-            JobRepository jobRepository,
-            ContextSanitizer contextSanitizer,
-            StreamingService streamingService,
-            ContextStorageMetrics contextStorageMetrics,
-            ContextReadService contextReadService,
-            ContextProperties contextProperties,
-            io.terrakube.api.plugin.policy.PolicyEvaluationService policyEvaluationService,
-            JobLogAccessService jobLogAccessService,
-            AuthenticatedUser authenticatedUser) {
-        this(storageTypeService, jobRepository, contextSanitizer, streamingService,
-                contextStorageMetrics, contextReadService, contextProperties, policyEvaluationService, jobLogAccessService, authenticatedUser, null);
-    }
-
-    public ContextController(
-            StorageTypeService storageTypeService,
-            JobRepository jobRepository,
-            ContextSanitizer contextSanitizer,
-            StreamingService streamingService,
-            ContextStorageMetrics contextStorageMetrics,
-            ContextReadService contextReadService,
-            ContextProperties contextProperties,
-            io.terrakube.api.plugin.policy.PolicyEvaluationService policyEvaluationService,
-            JobLogAccessService jobLogAccessService) {
-        this(storageTypeService, jobRepository, contextSanitizer, streamingService,
-                contextStorageMetrics, contextReadService, contextProperties, policyEvaluationService, jobLogAccessService, null);
-    }
-
-    public ContextController(
-            StorageTypeService storageTypeService,
-            JobRepository jobRepository,
-            ContextSanitizer contextSanitizer,
-            StreamingService streamingService,
-            ContextStorageMetrics contextStorageMetrics,
-            ContextReadService contextReadService,
-            ContextProperties contextProperties,
-            io.terrakube.api.plugin.policy.PolicyEvaluationService policyEvaluationService,
-            AuthenticatedUser authenticatedUser) {
-        this(storageTypeService, jobRepository, contextSanitizer, streamingService,
-                contextStorageMetrics, contextReadService, contextProperties, policyEvaluationService, null, authenticatedUser);
-    }
-
-    public ContextController(
-            StorageTypeService storageTypeService,
-            JobRepository jobRepository,
-            ContextSanitizer contextSanitizer,
-            StreamingService streamingService,
-            ContextStorageMetrics contextStorageMetrics,
-            ContextReadService contextReadService,
-            ContextProperties contextProperties,
-            io.terrakube.api.plugin.policy.PolicyEvaluationService policyEvaluationService) {
-        this(storageTypeService, jobRepository, contextSanitizer, streamingService,
-                contextStorageMetrics, contextReadService, contextProperties, policyEvaluationService, null, null);
+        this.objectMapper = objectMapper;
     }
 
     public ResponseEntity<String> getContext(int jobId) {
@@ -173,8 +86,8 @@ public class ContextController {
             }
         }
 
-        // The executor merges its output into what it reads here and writes it back, so a stale
-        // per-pod cache entry would overwrite newer data; only UI polling is served from the cache.
+        // The executor's only read is the apply step seeding from the plan output, which must see the
+        // latest document rather than a stale per-pod cache entry; only UI polling is served from the cache.
         boolean executor = principal != null && authenticatedUser != null && authenticatedUser.isServiceAccountInternal(new User(principal));
         String context;
         try {
@@ -209,96 +122,78 @@ public class ContextController {
     }
 
     @PostMapping(value = "/{jobId}", produces = MediaType.APPLICATION_JSON_VALUE)
-    @Transactional
     public ResponseEntity<String> saveContext(@PathVariable("jobId") int jobId, @RequestBody String context, Principal principal) {
         Authentication authentication = principal instanceof Authentication a ? a : null;
         if (jobLogAccessService != null && !jobLogAccessService.canWriteContext(authentication, jobId)) {
             return ResponseEntity.status(HttpStatus.FORBIDDEN).build();
         }
 
-        String sanitizedContext;
+        ObjectNode incoming;
         try {
-            sanitizedContext = contextSanitizer.sanitize(context);
+            if (!(objectMapper.readTree(context) instanceof ObjectNode document)) {
+                log.warn("Context payload for job {} is not a JSON object", jobId);
+                return new ResponseEntity<>("{}", HttpStatus.BAD_REQUEST);
+            }
+            incoming = document;
         } catch (JacksonException e) {
             log.warn("Invalid context payload for job {}", jobId, e);
             return new ResponseEntity<>("{}", HttpStatus.BAD_REQUEST);
-        } catch (IOException e) {
-            log.warn("Controlled failure sanitizing context for job {}: {}", jobId, e.getMessage());
-            return new ResponseEntity<>("{}", HttpStatus.SERVICE_UNAVAILABLE);
         }
 
-        Optional<Job> jobOptional = jobRepository.findById(jobId);
-        if (jobOptional.isEmpty()) {
-            log.warn("Cannot save context for missing job {}", jobId);
-            return new ResponseEntity<>("{}", HttpStatus.NOT_FOUND);
-        }
-
-        Job job = jobOptional.get();
-        if (!CONTEXT_WRITABLE_JOB_STATUSES.contains(job.getStatus())) {
-            log.warn("Cannot save context for job {} with status {}", jobId, job.getStatus());
-            return new ResponseEntity<>("{}", HttpStatus.CONFLICT);
-        }
-
-        String lockToken = acquireContextLock(jobId);
-        if (lockToken == null) {
-            log.warn("Context lock busy for job {}", jobId);
-            return new ResponseEntity<>("{}", HttpStatus.SERVICE_UNAVAILABLE);
-        }
-
-        String savedContext;
+        ContextWriteService.ReplaceResult result;
         try {
-            String contextToSave = sanitizedContext;
-            savedContext = contextStorageMetrics.time("write", () -> storageTypeService.saveContext(jobId, contextToSave));
-            // Refresh the read cache so a Job Details page open right after the write sees this snapshot.
-            contextReadService.invalidate(jobId, savedContext);
-            if (policyEvaluationService != null) {
-                policyEvaluationService.processPolicyEvaluationContext(jobId, sanitizedContext);
-            }
-            return new ResponseEntity<>(savedContext, HttpStatus.OK);
+            result = contextWriteService.replace(jobId, incoming);
+        } catch (ResponseStatusException e) {
+            return new ResponseEntity<>("{}", e.getStatusCode());
         } catch (IOException | RuntimeException e) {
+            // Includes a context write lock that could not be taken in time.
             log.warn("Controlled failure saving context for job {}: {}", jobId, e.getMessage());
-            return new ResponseEntity<>("{}", HttpStatus.SERVICE_UNAVAILABLE);
-        } finally {
-            releaseContextLock(jobId, lockToken);
+            return unavailable();
         }
+        // Runs after the write lock is released, so it is not held during policy processing.
+        if (policyEvaluationService != null && result.policyChanged()) {
+            policyEvaluationService.processPolicyEvaluationContext(jobId, result.saved());
+        }
+        return new ResponseEntity<>(result.saved(), HttpStatus.OK);
     }
 
-    private String acquireContextLock(int jobId) {
-        if (redisTemplate == null) {
-            return "NO_REDIS";
-        }
-        String token = UUID.randomUUID().toString();
-        try {
-            for (int i = 0; i < 5; i++) {
-                Boolean acquired = redisTemplate.opsForValue()
-                        .setIfAbsent(CONTEXT_LOCK_PREFIX + jobId, token, CONTEXT_LOCK_TTL);
-                if (Boolean.TRUE.equals(acquired)) {
-                    return token;
-                }
-                Thread.sleep(100);
-            }
-            return null;
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return null;
-        } catch (Exception e) {
-            log.warn("Could not reach Redis to acquire context lock for Job {}: {}", jobId, e.getMessage());
-            return null;
-        }
+    public ResponseEntity<String> patchContext(int jobId, String patch) {
+        return patchContext(jobId, patch, (Principal) null);
     }
 
-    private void releaseContextLock(int jobId, String lockToken) {
-        if (redisTemplate == null || lockToken == null || "NO_REDIS".equals(lockToken)) {
-            return;
+    /**
+     * Sets individual context entries ({@code {"revision": n, "set": {path: value|null}}}). An entry
+     * older than or equal to the one stored is skipped, so a retried or reordered write is a no-op.
+     */
+    @PostMapping(value = "/{jobId}/patch", produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<String> patchContext(@PathVariable("jobId") int jobId, @RequestBody String patch, Principal principal) {
+        Authentication authentication = principal instanceof Authentication a ? a : null;
+        if (jobLogAccessService != null && !jobLogAccessService.canWriteContext(authentication, jobId)) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).build();
         }
+
+        // Validated before the write lock is taken.
+        ContextPatchApplier.Patch parsed;
         try {
-            Object current = redisTemplate.opsForValue().get(CONTEXT_LOCK_PREFIX + jobId);
-            if (lockToken.equals(current)) {
-                redisTemplate.delete(CONTEXT_LOCK_PREFIX + jobId);
-            }
-        } catch (Exception e) {
-            log.warn("Could not reach Redis to release context lock for Job {}: {}", jobId, e.getMessage());
+            parsed = ContextPatchApplier.parse(objectMapper.readTree(patch), System.currentTimeMillis());
+        } catch (JacksonException | InvalidContextPatchException e) {
+            log.warn("Invalid context patch for job {}", jobId);
+            return new ResponseEntity<>("{}", HttpStatus.BAD_REQUEST);
         }
+
+        ContextWriteService.PatchResult result;
+        try {
+            result = contextWriteService.patch(jobId, parsed);
+        } catch (ResponseStatusException e) {
+            return new ResponseEntity<>("{}", e.getStatusCode());
+        } catch (IOException | RuntimeException e) {
+            log.warn("Controlled failure patching context for job {}: {}", jobId, e.getMessage());
+            return unavailable();
+        }
+        if (policyEvaluationService != null && result.applied().contains("policyEvaluation")) {
+            policyEvaluationService.processPolicyEvaluationContext(jobId, result.context());
+        }
+        return new ResponseEntity<>("{\"applied\":" + result.applied().size() + ",\"skipped\":" + result.skipped() + "}", HttpStatus.OK);
     }
 
     public SseEmitter streamContext(String jobId, String lastEventId) {
@@ -337,6 +232,10 @@ public class ContextController {
             return RecordId.of("0-0");
         }
         try {
+            if (!lastEventId.matches("\\d+(-\\d+)?")) {
+                // e.g. "*" parses as a RecordId but carries no position.
+                throw new IllegalArgumentException("not a stream position");
+            }
             return RecordId.of(lastEventId);
         } catch (IllegalArgumentException e) {
             log.warn("Ignoring unparseable Last-Event-ID '{}': {}", lastEventId, e.getMessage());

@@ -35,7 +35,7 @@ import io.terrakube.api.plugin.context.ContextSanitizer;
 @Service
 public class SpoolRecoveryService {
 
-    private static final String CONTEXT_LOCK_PREFIX = "job-context-lock:";
+    private static final String CONTEXT_LOCK_PREFIX = "job-context-write-lock:";
     private static final Duration CONTEXT_LOCK_TTL = Duration.ofSeconds(30);
 
     private final StepRepository stepRepository;

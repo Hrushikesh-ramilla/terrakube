@@ -136,23 +136,12 @@ public class ApplyStructuredOutputService {
         return seeded;
     }
 
-    @SuppressWarnings("unchecked")
-    Map<String, Object> updateApplyContext(Map<String, Object> context, String stepId, List<Map<String, Object>> changes, List<Map<String, Object>> jobDiagnostics) {
-        Map<String, Object> updatedContext = new HashMap<>(context);
-
-        Map<String, Object> applyStructuredOutput = updatedContext.get(CONTEXT_APPLY_KEY) instanceof Map<?, ?> existing
-                ? new HashMap<>((Map<String, Object>) existing)
-                : new HashMap<>();
-        applyStructuredOutput.put(stepId, changes);
-        updatedContext.put(CONTEXT_APPLY_KEY, applyStructuredOutput);
-
-        Map<String, Object> jobDiagnosticsByStep = updatedContext.get(CONTEXT_JOB_DIAGNOSTICS_KEY) instanceof Map<?, ?> existingDiagnostics
-                ? new HashMap<>((Map<String, Object>) existingDiagnostics)
-                : new HashMap<>();
-        jobDiagnosticsByStep.put(stepId, jobDiagnostics);
-        updatedContext.put(CONTEXT_JOB_DIAGNOSTICS_KEY, jobDiagnosticsByStep);
-
-        return updatedContext;
+    Map<String, Object> buildApplyPatch(String stepId, List<Map<String, Object>> changes, List<Map<String, Object>> jobDiagnostics) {
+        // HashMap, not Map.of: values may be null.
+        Map<String, Object> set = new HashMap<>();
+        set.put(CONTEXT_APPLY_KEY + "/" + stepId, changes);
+        set.put(CONTEXT_JOB_DIAGNOSTICS_KEY + "/" + stepId, jobDiagnostics);
+        return set;
     }
 
     /**
@@ -188,26 +177,24 @@ public class ApplyStructuredOutputService {
     }
 
     public String publishFinalApplySynchronous(String organizationId, String jobId, String stepId,
-                                               List<Map<String, Object>> changes, List<Map<String, Object>> jobDiagnostics) {
+                                                List<Map<String, Object>> changes, List<Map<String, Object>> jobDiagnostics) {
         return publishFinalApplySynchronous(organizationId, jobId, stepId, 1L, changes, jobDiagnostics);
     }
 
     public String publishFinalApplySynchronous(String organizationId, String jobId, String stepId, long deliveryRevision,
-                                               List<Map<String, Object>> changes, List<Map<String, Object>> jobDiagnostics) {
-        Map<String, Object> updatedContext = null;
-        try {
-            Map<String, Object> context = getCurrentContext(organizationId, jobId);
-            updatedContext = updateApplyContext(context, stepId, changes, jobDiagnostics);
-            updatedContext.put("structuredOutputStatus", Map.of(
-                    "state", "PERSISTED",
-                    "updatedAtEpochMs", System.currentTimeMillis(),
-                    "stepId", stepId,
-                    "phase", "apply",
-                    "finalSnapshot", true));
+                                                List<Map<String, Object>> changes, List<Map<String, Object>> jobDiagnostics) {
+        Map<String, Object> set = buildApplyPatch(stepId, changes, jobDiagnostics);
+        set.put("structuredOutputStatus", Map.of(
+                "state", "PERSISTED",
+                "updatedAtEpochMs", System.currentTimeMillis(),
+                "stepId", stepId,
+                "phase", "apply",
+                "finalSnapshot", true));
 
+        try {
             for (int attempt = 1; attempt <= 3; attempt++) {
-                boolean saved = jobContextService.saveContextChecked(organizationId, jobId, updatedContext);
-                if (saved) {
+                JobContextService.PatchResult result = jobContextService.patchContext(organizationId, jobId, deliveryRevision, set);
+                if (result == JobContextService.PatchResult.APPLIED || result == JobContextService.PatchResult.SKIPPED) {
                     log.info("Synchronous final apply snapshot persisted and ACKed for job {} step {}", jobId, stepId);
                     pushLiveUpdate("apply", jobId, stepId, changes, jobDiagnostics);
                     return "ACKED";
@@ -224,23 +211,22 @@ public class ApplyStructuredOutputService {
             log.warn("Failed to obtain synchronous ACK for final apply snapshot for job {} step {} after 3 attempts", jobId, stepId);
         } catch (Exception e) {
             log.warn("Error publishing synchronous final apply snapshot for job {} step {}: {}", jobId, stepId, e.getMessage());
-            if (updatedContext == null) {
-                updatedContext = new LinkedHashMap<>();
-                updatedContext.put(CONTEXT_APPLY_KEY, Map.of(stepId, changes != null ? changes : List.of()));
-                if (jobDiagnostics != null && !jobDiagnostics.isEmpty()) {
-                    updatedContext.put(CONTEXT_JOB_DIAGNOSTICS_KEY, Map.of(stepId, jobDiagnostics));
-                }
-                updatedContext.put("structuredOutputStatus", Map.of(
-                        "state", "PERSISTED",
-                        "updatedAtEpochMs", System.currentTimeMillis(),
-                        "stepId", stepId,
-                        "phase", "apply",
-                        "finalSnapshot", true));
-            }
         }
 
-        if (contextSpoolService != null && updatedContext != null) {
-            String spooledPath = contextSpoolService.spoolContextPatch(organizationId, jobId, stepId, "apply", deliveryRevision, updatedContext);
+        Map<String, Object> spooledPatch = new LinkedHashMap<>();
+        spooledPatch.put(CONTEXT_APPLY_KEY, Map.of(stepId, changes != null ? changes : List.of()));
+        if (jobDiagnostics != null && !jobDiagnostics.isEmpty()) {
+            spooledPatch.put(CONTEXT_JOB_DIAGNOSTICS_KEY, Map.of(stepId, jobDiagnostics));
+        }
+        spooledPatch.put("structuredOutputStatus", Map.of(
+                "state", "PERSISTED",
+                "updatedAtEpochMs", System.currentTimeMillis(),
+                "stepId", stepId,
+                "phase", "apply",
+                "finalSnapshot", true));
+
+        if (contextSpoolService != null) {
+            String spooledPath = contextSpoolService.spoolContextPatch(organizationId, jobId, stepId, "apply", deliveryRevision, spooledPatch);
             if (spooledPath != null) {
                 log.info("Successfully spooled final apply snapshot to storage at {} for job {} step {}", spooledPath, jobId, stepId);
                 return "SPOOLED";
@@ -271,7 +257,7 @@ public class ApplyStructuredOutputService {
         if (executorFlagsProperties.isAsyncStructuredOutput() && persistenceQueue != null) {
             try {
                 StructuredSnapshot snapshot = StructuredSnapshot.copyOf(organizationId, jobId, stepId,
-                        StructuredSnapshot.Phase.APPLY, persistenceQueue.nextSequence(), finalSnapshot,
+                        StructuredSnapshot.Phase.APPLY, persistenceQueue.nextSequence(jobId), finalSnapshot,
                         changes, jobDiagnostics, objectMapper);
                 persistenceQueue.submit(snapshot);
             } catch (StructuredSnapshot.SnapshotSerializationException e) {
@@ -283,9 +269,8 @@ public class ApplyStructuredOutputService {
         }
 
         try {
-            Map<String, Object> context = getCurrentContext(organizationId, jobId);
-            Map<String, Object> updatedContext = updateApplyContext(context, stepId, changes, jobDiagnostics);
-            saveContext(organizationId, jobId, updatedContext);
+            jobContextService.patchContextFresh(organizationId, jobId,
+                    buildApplyPatch(stepId, changes, jobDiagnostics));
         } catch (Exception e) {
             log.warn("Unable to publish apply structured output for job {} step {}", jobId, stepId, e);
         }
@@ -517,10 +502,6 @@ public class ApplyStructuredOutputService {
 
     private Map<String, Object> getCurrentContext(String organizationId, String jobId) {
         return jobContextService.getCurrentContext(organizationId, jobId);
-    }
-
-    private void saveContext(String organizationId, String jobId, Map<String, Object> context) {
-        jobContextService.saveContext(organizationId, jobId, context);
     }
 }
 
