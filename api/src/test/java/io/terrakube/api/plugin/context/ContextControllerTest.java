@@ -411,7 +411,14 @@ class ContextControllerTest {
         @SuppressWarnings("unchecked")
         org.springframework.data.redis.core.ValueOperations<String, Object> valueOps = Mockito.mock(org.springframework.data.redis.core.ValueOperations.class);
         when(redisTemplate.opsForValue()).thenReturn(valueOps);
-        when(valueOps.setIfAbsent(Mockito.eq("job-context-lock:1"), Mockito.eq("1"), Mockito.any(java.time.Duration.class))).thenReturn(Boolean.TRUE);
+
+        java.util.concurrent.atomic.AtomicReference<String> tokenHolder = new java.util.concurrent.atomic.AtomicReference<>();
+        when(valueOps.setIfAbsent(Mockito.eq("job-context-lock:1"), Mockito.anyString(), Mockito.any(java.time.Duration.class)))
+                .thenAnswer(inv -> {
+                    tokenHolder.set(inv.getArgument(1));
+                    return Boolean.TRUE;
+                });
+        when(valueOps.get(Mockito.eq("job-context-lock:1"))).thenAnswer(inv -> tokenHolder.get());
 
         ContextController controller = new ContextController(storageTypeService, jobRepository,
                 new ContextSanitizer(new ObjectMapper()), Mockito.mock(StreamingService.class),
@@ -423,7 +430,7 @@ class ContextControllerTest {
         ResponseEntity<String> response = controller.saveContext(1, "{}");
 
         assertEquals(HttpStatus.OK, response.getStatusCode());
-        verify(valueOps).setIfAbsent(Mockito.eq("job-context-lock:1"), Mockito.eq("1"), Mockito.any(java.time.Duration.class));
+        verify(valueOps).setIfAbsent(Mockito.eq("job-context-lock:1"), Mockito.anyString(), Mockito.any(java.time.Duration.class));
         verify(redisTemplate).delete("job-context-lock:1");
     }
 
@@ -440,7 +447,7 @@ class ContextControllerTest {
         @SuppressWarnings("unchecked")
         org.springframework.data.redis.core.ValueOperations<String, Object> valueOps = Mockito.mock(org.springframework.data.redis.core.ValueOperations.class);
         when(redisTemplate.opsForValue()).thenReturn(valueOps);
-        when(valueOps.setIfAbsent(Mockito.eq("job-context-lock:1"), Mockito.eq("1"), Mockito.any(java.time.Duration.class))).thenReturn(Boolean.FALSE);
+        when(valueOps.setIfAbsent(Mockito.eq("job-context-lock:1"), Mockito.anyString(), Mockito.any(java.time.Duration.class))).thenReturn(Boolean.FALSE);
 
         ContextController controller = new ContextController(storageTypeService, jobRepository,
                 new ContextSanitizer(new ObjectMapper()), Mockito.mock(StreamingService.class),
@@ -454,6 +461,35 @@ class ContextControllerTest {
         assertEquals(HttpStatus.SERVICE_UNAVAILABLE, response.getStatusCode());
         verify(storageTypeService, never()).saveContext(Mockito.anyInt(), Mockito.anyString());
         verify(redisTemplate, never()).delete(Mockito.anyString());
+    }
+
+    @Test
+    void saveContextReturns503WhenRedisThrowsException() throws IOException {
+        StorageTypeService storageTypeService = Mockito.mock(StorageTypeService.class);
+        JobRepository jobRepository = Mockito.mock(JobRepository.class);
+        Job job = Mockito.mock(Job.class);
+        when(job.getStatus()).thenReturn(JobStatus.running);
+        when(jobRepository.findById(1)).thenReturn(Optional.of(job));
+
+        @SuppressWarnings("unchecked")
+        org.springframework.data.redis.core.RedisTemplate<String, Object> redisTemplate = Mockito.mock(org.springframework.data.redis.core.RedisTemplate.class);
+        @SuppressWarnings("unchecked")
+        org.springframework.data.redis.core.ValueOperations<String, Object> valueOps = Mockito.mock(org.springframework.data.redis.core.ValueOperations.class);
+        when(redisTemplate.opsForValue()).thenReturn(valueOps);
+        when(valueOps.setIfAbsent(Mockito.eq("job-context-lock:1"), Mockito.anyString(), Mockito.any(java.time.Duration.class)))
+                .thenThrow(new RuntimeException("Redis connection refused"));
+
+        ContextController controller = new ContextController(storageTypeService, jobRepository,
+                new ContextSanitizer(new ObjectMapper()), Mockito.mock(StreamingService.class),
+                new ContextStorageMetrics(new SimpleMeterRegistry()),
+                Mockito.mock(ContextReadService.class), new ContextProperties(),
+                Mockito.mock(io.terrakube.api.plugin.policy.PolicyEvaluationService.class),
+                null, authenticatedUser(), redisTemplate);
+
+        ResponseEntity<String> response = controller.saveContext(1, "{}");
+
+        assertEquals(HttpStatus.SERVICE_UNAVAILABLE, response.getStatusCode());
+        verify(storageTypeService, never()).saveContext(Mockito.anyInt(), Mockito.anyString());
     }
 }
 

@@ -32,6 +32,7 @@ import java.time.Duration;
 import java.util.EnumSet;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 
 @Slf4j
 @RestController
@@ -49,7 +50,7 @@ public class ContextController {
     private static final String PENDING_BODY = "{\"structuredOutputStatus\":{\"state\":\"PENDING\"}}";
 
     private static final String CONTEXT_LOCK_PREFIX = "job-context-lock:";
-    private static final Duration CONTEXT_LOCK_TTL = Duration.ofSeconds(10);
+    private static final Duration CONTEXT_LOCK_TTL = Duration.ofSeconds(30);
 
     private final StorageTypeService storageTypeService;
 
@@ -238,7 +239,8 @@ public class ContextController {
             return new ResponseEntity<>("{}", HttpStatus.CONFLICT);
         }
 
-        if (!acquireContextLock(jobId)) {
+        String lockToken = acquireContextLock(jobId);
+        if (lockToken == null) {
             log.warn("Context lock busy for job {}", jobId);
             return new ResponseEntity<>("{}", HttpStatus.SERVICE_UNAVAILABLE);
         }
@@ -257,39 +259,43 @@ public class ContextController {
             log.warn("Controlled failure saving context for job {}: {}", jobId, e.getMessage());
             return new ResponseEntity<>("{}", HttpStatus.SERVICE_UNAVAILABLE);
         } finally {
-            releaseContextLock(jobId);
+            releaseContextLock(jobId, lockToken);
         }
     }
 
-    private boolean acquireContextLock(int jobId) {
+    private String acquireContextLock(int jobId) {
         if (redisTemplate == null) {
-            return true;
+            return "NO_REDIS";
         }
+        String token = UUID.randomUUID().toString();
         try {
             for (int i = 0; i < 5; i++) {
                 Boolean acquired = redisTemplate.opsForValue()
-                        .setIfAbsent(CONTEXT_LOCK_PREFIX + jobId, "1", CONTEXT_LOCK_TTL);
+                        .setIfAbsent(CONTEXT_LOCK_PREFIX + jobId, token, CONTEXT_LOCK_TTL);
                 if (Boolean.TRUE.equals(acquired)) {
-                    return true;
+                    return token;
                 }
                 Thread.sleep(100);
             }
-            return false;
+            return null;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            return false;
+            return null;
         } catch (Exception e) {
             log.warn("Could not reach Redis to acquire context lock for Job {}: {}", jobId, e.getMessage());
-            return true;
+            return null;
         }
     }
 
-    private void releaseContextLock(int jobId) {
-        if (redisTemplate == null) {
+    private void releaseContextLock(int jobId, String lockToken) {
+        if (redisTemplate == null || lockToken == null || "NO_REDIS".equals(lockToken)) {
             return;
         }
         try {
-            redisTemplate.delete(CONTEXT_LOCK_PREFIX + jobId);
+            Object current = redisTemplate.opsForValue().get(CONTEXT_LOCK_PREFIX + jobId);
+            if (lockToken.equals(current)) {
+                redisTemplate.delete(CONTEXT_LOCK_PREFIX + jobId);
+            }
         } catch (Exception e) {
             log.warn("Could not reach Redis to release context lock for Job {}: {}", jobId, e.getMessage());
         }
